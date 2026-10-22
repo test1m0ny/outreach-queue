@@ -279,11 +279,13 @@ dialog::backdrop{background:rgba(18,38,26,.45)}
         <button role="tab" data-tab="queue">Queue</button>
         <button role="tab" data-tab="leads">Leads</button>
         <button role="tab" data-tab="messages">Messages</button>
+        <button role="tab" data-tab="replies">Replies</button>
         <button role="tab" data-tab="account">Account</button>
       </nav>
       <section data-pane="queue" id="tab-queue"></section>
       <section data-pane="leads" id="tab-leads" hidden></section>
       <section data-pane="messages" id="tab-messages" hidden></section>
+      <section data-pane="replies" id="tab-replies" hidden></section>
       <section data-pane="account" id="tab-account" hidden></section>
     </div>
   </main>
@@ -412,7 +414,7 @@ async function loadAll(){
   const since = new Date(Date.now() - DAY).toISOString();
   const s = await sb.from('sends').select('id', {count:'exact', head:true}).gte('created_at', since);
   sentLast24h = s.count || 0;
-  render();
+  render(); syncReminders();
 }
 
 /* ---------- actions ---------- */
@@ -544,7 +546,7 @@ function download(name, text, type){
 function render(){
   if(!user) return;
   $('#capBox').hidden = false;
-  $('#userEmail').textContent = user.email;
+  renderMe();
   const used = sentLast24h, cap = profile ? profile.daily_cap : 30;
   $('#capText').textContent = `${used} of ${cap} messages in the last 24 hours`;
   $('#capFill').style.width = Math.min(100, used / cap * 100) + '%';
@@ -557,7 +559,7 @@ function render(){
   $('#campOffer').textContent = OFFERS[c.offer].label;
   document.querySelectorAll('.tabs button').forEach(b => b.setAttribute('aria-selected', String(b.dataset.tab === tab)));
   document.querySelectorAll('[data-pane]').forEach(p => p.hidden = p.dataset.pane !== tab);
-  ({queue:renderQueue, leads:renderLeads, messages:renderMessages, account:renderAccount})[tab](c);
+  ({queue:renderQueue, leads:renderLeads, messages:renderMessages, replies:renderReplies, account:renderAccount})[tab](c);
 }
 function renderSide(){
   $('#campList').innerHTML = campaigns.map(c => {
@@ -609,6 +611,12 @@ function renderQueue(c){
     ${body}`;
 }
 function openSheet(id){
+  openSheet0(id);
+  $('#sheetBody').insertAdjacentHTML('afterbegin', `<label>Paste their WhatsApp reply
+    <textarea id="rpText" placeholder="Paste what they wrote and the app sets the status for you"></textarea></label>
+    <button class="btn" data-act="aireply" data-id="${id}">Log reply</button><hr style="width:100%;border:0;border-top:1px solid var(--line)">`);
+}
+function openSheet0(id){
   const l = leads.find(x => x.id === id); if(!l) return;
   $('#sheetTitle').textContent = l.name;
   $('#sheetBody').innerHTML = `<p class="lead-line" style="margin:0">What did they say?</p>
@@ -672,6 +680,16 @@ function renderMessages(c){
     <button class="btn ghost" data-act="restore">Restore default wording</button>`;
 }
 function renderAccount(c){
+  renderAccount0(c);
+  const perm = ('Notification' in window) ? Notification.permission : 'unsupported';
+  $('#tab-account').insertAdjacentHTML('afterbegin', `
+    <div class="panel"><h3>Profile</h3><div class="row"><span class="avatar" style="display:inline-block">${avatarHTML(meta().avatar, meta().name)}</span><b>${esc(meta().name || '')}</b></div>
+      <div><button class="btn ghost" data-act="editprofile">Edit name and avatar</button></div></div>
+    <div class="panel"><h3>Follow-up notifications</h3>
+      <p>${perm === 'granted' ? 'On for this device. You get a notification when follow-ups fall due, even when the app is closed.' : perm === 'denied' ? 'Blocked in your browser settings for this site.' : perm === 'unsupported' ? 'This browser does not support notifications.' : 'Off for this device.'}</p>
+      <div class="row">${perm === 'default' ? '<button class="btn" data-act="pushon">Turn on notifications</button>' : ''}${perm === 'granted' ? '<button class="btn ghost" data-act="pushtest">Send a test</button>' : ''}</div></div>`);
+}
+function renderAccount0(c){
   $('#tab-account').innerHTML = `
     <div class="panel">
       <h3>Your account</h3>
@@ -813,6 +831,10 @@ document.addEventListener('click', async e => {
       const [y,m,d] = v.split('-').map(Number);
       await setStatus(id, 'later', {later_date: new Date(y, m-1, d).toISOString()}); break;
     }
+    case 'editprofile': showProfile(true); break;
+    case 'pushon': await enablePush(); break;
+    case 'pushtest': { const r = await api('/api/push/test', {method:'POST'}); toast(r && r.sent ? 'Test sent. Check your notifications.' : 'No subscribed device found. Turn notifications on again.'); break; }
+    case 'aireply': await logReply(id); break;
     case 'sheet': openSheet(id); break;
     case 'sheetclose': $('#sheet').close(); break;
     case 'skip': skipped.add(id); render(); break;
@@ -878,6 +900,118 @@ document.addEventListener('click', e => {
 $('#legalClose').addEventListener('click', () => $('#legalDlg').close());
 $('#signOutBtn').addEventListener('click', async () => { await sb.auth.signOut(); location.reload(); });
 
+/* ---------- profile, avatar, replies, reminders ---------- */
+const meta = () => (user && user.user_metadata) || {};
+const AV = [['🦁','#F2B84B'],['🐯','#F28C4B'],['🐼','#B9C4CC'],['🦉','#A98B6A'],['🚀','#7FB2E5'],['🌟','#F2D84B']];
+function avatarHTML(v, name){
+  if(v && v.startsWith('/api/')) return `<img src="${esc(v)}" alt="">`;
+  const f = AV.find(x => x[0] === v);
+  return `<span style="display:grid;place-items:center;width:100%;height:100%;background:${f ? f[1] : '#2FA35B'};color:#fff;font-size:1.1rem;font-weight:700">${f ? f[0] : esc((name || user.email || '?').trim().charAt(0).toUpperCase())}</span>`;
+}
+async function api(path, opts){
+  const {data} = await sb.auth.getSession();
+  const o = Object.assign({}, opts || {}); o.headers = Object.assign({authorization: 'Bearer ' + (data.session ? data.session.access_token : '')}, o.headers || {});
+  try{ const r = await fetch(path, o); return r.status === 204 ? {} : await r.json(); }catch(e){ return null; }
+}
+function dueCount(){ return leads.filter(l => ['due','checkin'].includes(bucketOf(l))).length; }
+function renderMe(){
+  $('#userEmail').textContent = meta().name || user.email;
+  const a = $('#meAvatar'); a.hidden = false; a.innerHTML = avatarHTML(meta().avatar, meta().name);
+  const n = dueCount(); $('#bellBtn').hidden = n === 0; $('#bellCount').hidden = n === 0; $('#bellCount').textContent = n;
+  document.title = (n ? '(' + n + ') ' : '') + 'Outreach Queue | Testimony Digital Solutions';
+}
+let pickedAv = null;
+function showProfile(editing){
+  document.body.classList.add('authmode');
+  ['#appView','#authView'].forEach(s => $(s).hidden = true); $('#capBox').hidden = true; $('#profileView').hidden = false;
+  $('#profName').value = meta().name || meta().full_name || '';
+  pickedAv = meta().avatar || AV[0][0];
+  $('#profCancel').hidden = !editing; $('#profileTitle').textContent = editing ? 'Edit profile' : 'Complete your sign-up';
+  drawAv();
+}
+function drawAv(){
+  $('#avPreview').innerHTML = avatarHTML(pickedAv, $('#profName').value);
+  $('#avGrid').innerHTML = AV.map(([e, c]) => `<button type="button" data-av="${e}" style="background:${c};border:3px solid ${e === pickedAv ? '#2FE0B5' : 'transparent'};border-radius:50%;aspect-ratio:1;font-size:1.5rem;cursor:pointer" aria-label="Avatar ${e}">${e}</button>`).join('');
+}
+function closeProfile(){ $('#profileView').hidden = true; document.body.classList.remove('authmode'); $('#appView').hidden = false; render(); }
+async function saveProfile(){
+  const name = $('#profName').value.trim(), er = $('#profError'); er.hidden = true;
+  if(!name){ er.textContent = 'Enter your name.'; er.hidden = false; return; }
+  const {data, error} = await sb.auth.updateUser({data:{name, avatar: pickedAv}});
+  if(error){ er.textContent = error.message; er.hidden = false; return; }
+  user = data.user; closeProfile();
+}
+async function uploadAvatar(file){
+  const er = $('#profError'); er.hidden = true;
+  const r = await api('/api/avatar', {method:'POST', headers:{'content-type': file.type}, body: file});
+  if(!r || !r.url){ er.textContent = (r && r.error) || 'The photo could not be uploaded.'; er.hidden = false; return; }
+  pickedAv = r.url; drawAv();
+}
+function localClassify(t){
+  if(/\b(stop|unsubscribe|remove me|not interested|wrong number)\b|^\s*3\b/i.test(t)) return 'stop';
+  if(/\b(not now|later|busy|next (week|month)|another time)\b|^\s*2\b/i.test(t)) return 'later';
+  if(/^\s*1\b|\b(yes|yeah|sure|interested|show me|send it|go ahead)\b/i.test(t)) return 'interested';
+  return 'replied';
+}
+async function logReply(id){
+  const l = leads.find(x => x.id === id), text = ($('#rpText').value || '').trim(); if(!l) return;
+  if(!text) return toast('Paste their reply first.');
+  const r = await api('/api/replies', {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({lead_id: l.id, campaign_id: l.campaign_id, lead_name: l.name, text})});
+  if(r && r.outcome){
+    await setStatus(id, r.outcome, r.outcome === 'later' && r.laterDate ? {later_date: r.laterDate} : null);
+    toast('Logged: ' + (r.summary || r.outcome) + '. See it in Replies.');
+  } else {
+    const o = localClassify(text);
+    await patchLead(id, {note: ('Reply: ' + text).slice(0, 500)});
+    await setStatus(id, o, o === 'later' ? {later_date: new Date(Date.now() + 30*864e5).toISOString()} : null);
+    toast('The AI service was not available, so the status was set by keywords and the reply saved in the lead note.');
+  }
+}
+const OUT_LABEL = {interested:'Interested', replied:'Question', later:'Not now', stop:'Stop'};
+async function renderReplies(){
+  const box = $('#tab-replies'); box.innerHTML = '<p class="muted">Loading replies...</p>';
+  const rows = await api('/api/replies');
+  if(!Array.isArray(rows)){ box.innerHTML = '<p class="muted">Replies could not be loaded. Try again in a moment.</p>'; return; }
+  box.innerHTML = rows.length ? rows.map(r => `<article class="mini" style="margin-bottom:10px"><div class="row" style="justify-content:space-between"><b>${esc(r.leadName || 'Lead')}</b><span class="pill p-ok">${OUT_LABEL[r.outcome] || esc(r.outcome)}</span></div>
+    <p class="meta" style="margin:0">${new Date(r.createdAt).toLocaleString()}</p>${r.summary ? `<p style="margin:0">${esc(r.summary)}</p>` : ''}
+    <p class="meta" style="margin:0;white-space:pre-wrap">${esc(r.body)}</p></article>`).join('')
+    : '<div class="empty"><p><b>No replies logged yet.</b></p><p>Open Log reply on a lead and paste what they wrote.</p></div>';
+}
+let remTimer;
+function syncReminders(){
+  clearTimeout(remTimer);
+  remTimer = setTimeout(() => {
+    const items = leads.flatMap(l => l.status === 'sent' && l.sent_at ? [{lead_id:l.id, name:l.name, kind:'followup', due_at:new Date(ts(l.sent_at) + 3*DAY).toISOString()}]
+      : l.status === 'later' && l.later_date ? [{lead_id:l.id, name:l.name, kind:'checkin', due_at:l.later_date}] : []);
+    api('/api/reminders', {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({items})});
+  }, 1500);
+}
+async function enablePush(){
+  try{
+    if(!('serviceWorker' in navigator) || !('PushManager' in window)) return toast('This browser does not support push notifications.');
+    if(await Notification.requestPermission() !== 'granted') return render();
+    const reg = await navigator.serviceWorker.register('/sw.js'); await navigator.serviceWorker.ready;
+    const k = await api('/api/push/key'); if(!k || !k.publicKey) throw new Error('key');
+    const raw = atob(k.publicKey.replace(/-/g,'+').replace(/_/g,'/')), key = Uint8Array.from(raw, c => c.charCodeAt(0));
+    const sub = await reg.pushManager.subscribe({userVisibleOnly: true, applicationServerKey: key});
+    await api('/api/push/subscribe', {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(sub.toJSON())});
+    toast('Notifications are on for this device.'); render();
+  }catch(e){ toast('Notifications could not be turned on. Try again.'); }
+}
+document.addEventListener('click', e => {
+  if(e.target.closest('#bellBtn')){
+    const c = campaigns.find(c => leadsOf(c.id).some(l => ['due','checkin'].includes(bucketOf(l))));
+    if(c){ activeId = c.id; tab = 'queue'; qFilter = 'due'; qView = 'focus'; render(); }
+  }
+  const b = e.target.closest('[data-av]'); if(b){ pickedAv = b.dataset.av; drawAv(); }
+});
+$('#profSave').addEventListener('click', saveProfile);
+$('#profCancel').addEventListener('click', closeProfile);
+$('#profName').addEventListener('input', () => { $('#avPreview').innerHTML = avatarHTML(pickedAv, $('#profName').value); });
+$('#avFile').addEventListener('change', e => { if(e.target.files[0]) uploadAvatar(e.target.files[0]); e.target.value = ''; });
+$('#meAvatar').addEventListener('click', () => { tab = 'account'; render(); });
+setInterval(() => { if(user && profile) renderMe(); }, 600000);
+
 /* ---------- start ---------- */
 (async function start(){
   if(!sb){ showAuth(); return; }
@@ -888,6 +1022,7 @@ $('#signOutBtn').addEventListener('click', async () => { await sb.auth.signOut()
     document.body.classList.remove('authmode');
     $('#authView').hidden = true; $('#appView').hidden = false;
     await loadAll();
+    if(!meta().name) showProfile(false);
   }
   else { showAuth(); }
   sb.auth.onAuthStateChange((event, session) => {
